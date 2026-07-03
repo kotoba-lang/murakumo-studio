@@ -20,6 +20,28 @@ superproject (this repo is registered there via
   has moved, chat requests return a clear `503`/`500` rather than crashing the
   sidecar; every other feature (model manager, download, fleet announce) works
   independently of that.
+- **Real end-to-end generation now exists upstream, but isn't wired in yet.**
+  [`kotoba-lang/inference#4`](https://github.com/kotoba-lang/inference/pull/4)
+  (open, not merged) adds a genuinely working tokenizer + autoregressive decode
+  loop that runs the real full 42-layer `gemma4:e4b` on CPU without
+  crashing/NaN'ing. Two things block wiring it into `engine.clj` as-is:
+  1. The stable, working `generate` lives at `kotodama.inference.decode/generate`
+     (portable, takes an injected `:kotodama/forward-fn` + built tokenizer — a
+     primitive, not a one-call convenience fn) plus a JVM host adapter that's
+     currently only in `verify/` (smoke-test code, not a published API).
+     `kotodama.inference.core/generate` — what this engine actually calls — is
+     still the old unimplemented stub; the PR doesn't touch `core.cljc`.
+  2. **Output quality isn't there yet**: the PR's own report shows real
+     vocabulary tokens across mixed scripts, not coherent text, attributed to
+     missing AltUp / per-layer-embedding layers Gemma4 needs. Speed is also
+     ~100s/token on CPU (no KV-cache yet) — not viable for interactive chat
+     even once wired.
+
+  Follow-up once PR #4 is reviewed/merged: either give `inference` a stable
+  `core.cljc` entry point that wraps `decode/generate` + a JVM forward-fn (the
+  right long-term fix), or have this engine build its own forward-fn/tokenizer
+  the way the verify/ adapter does — but only after the AltUp gap is closed,
+  since wiring it now would just serve incoherent text to users.
 - **Model management, local OpenAI-compatible server, and fleet announce are
   real and tested** (see `test/murakumo_studio/models_test.clj`, and manual
   end-to-end verification of `src/murakumo_studio/engine.clj` via `curl`).
