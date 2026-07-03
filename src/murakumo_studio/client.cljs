@@ -55,7 +55,7 @@
                                 :max_tokens (or max-tokens 256)
                                 :stream false}))}))
 
-(defn- process-sse-buffer! [buf-atom done? {:keys [on-chunk on-done on-error]}]
+(defn- process-sse-buffer! [buf-atom done? {:keys [on-chunk on-done on-error on-note]}]
   (let [lines (str/split @buf-atom #"\n" -1)
         complete (if done? lines (butlast lines))
         remainder (if done? "" (or (last lines) ""))]
@@ -67,15 +67,21 @@
             (= payload "[DONE]") (when on-done (on-done))
             (seq payload)
             (let [data (js->clj (js/JSON.parse payload) :keywordize-keys true)]
-              (if (:error data)
-                (when on-error (on-error (:error data)))
+              (cond
+                (:error data) (when on-error (on-error (:error data)))
+                (:murakumo_studio/quality_note data)
+                (when on-note (on-note (:murakumo_studio/quality_note data)))
+                :else
                 (when-let [content (get-in data [:choices 0 :delta :content])]
                   (when on-chunk (on-chunk content)))))))))))
 
 (defn chat-completion-stream
   "Streams /v1/chat/completions over SSE. `callbacks` is
-  {:on-chunk (fn [content-str]) :on-done (fn []) :on-error (fn [msg])} — each
-  optional. Returns nothing; the caller drives UI state from the callbacks."
+  {:on-chunk (fn [content-str]) :on-done (fn []) :on-error (fn [msg])
+   :on-note (fn [note-str])} — each optional. :on-note carries engine-side
+  caveats (e.g. kotoba-lang/inference's current output-quality limitation),
+  sent once per response before any :on-chunk. Returns nothing; the caller
+  drives UI state from the callbacks."
   [{:keys [model messages temperature max-tokens]} callbacks]
   (-> (js/fetch (str (base-url) "/v1/chat/completions")
                 (clj->js {:method "POST"

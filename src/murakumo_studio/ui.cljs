@@ -132,9 +132,8 @@
     (when (and model (seq (clojure.string/trim input)))
       (let [user-msg {:role "user" :content input}
             history (conj messages user-msg)
-            ;; empty assistant placeholder, filled in progressively as SSE
-            ;; chunks arrive (real streaming once kotoba-lang/inference wires
-            ;; a token callback through — see engine.clj chat-completion-args)
+            ;; empty assistant placeholder, filled in progressively as real
+            ;; SSE token chunks arrive (kotoba-lang/inference#5 wired up)
             assistant-idx (count history)]
         (swap! state/state update :chat merge
                {:messages (conj history {:role "assistant" :content ""})
@@ -144,7 +143,8 @@
           :messages history
           :temperature (get-in @state/state [:settings :temperature])
           :max-tokens (get-in @state/state [:settings :max-tokens])}
-         {:on-chunk (fn [content]
+         {:on-note (fn [note] (swap! state/state assoc-in [:chat :note] note))
+          :on-chunk (fn [content]
                       (swap! state/state update-in [:chat :messages assistant-idx :content] str content))
           :on-done (fn [] (swap! state/state assoc-in [:chat :busy?] false))
           :on-error (fn [msg] (swap! state/state update :chat merge {:busy? false :error msg}))})))))
@@ -157,7 +157,7 @@
    [:div content]])
 
 (defn- chat-tab []
-  (let [{:keys [model messages input busy? error]} (:chat @state/state)
+  (let [{:keys [model messages input busy? error note]} (:chat @state/state)
         model-ids (mapv :id (get-in @state/state [:models :items]))]
     [shape/panel
      [:div
@@ -165,6 +165,7 @@
        {:value (or model "") :on-change #(swap! state/state assoc-in [:chat :model] (.. % -target -value))}]
       (when (empty? model-ids)
         [:div {:style {:opacity 0.6 :margin-top "6px"}} "No models loaded — pick one from the Models tab first."])
+      (when note [:div {:style {:opacity 0.7 :font-size "12px" :margin-top "6px"}} "⚠ " note])
       [:div {:style {:margin "10px 0" :max-height "340px" :overflow-y "auto"}}
        (for [[i m] (map-indexed vector messages)]
          ^{:key i} [message-bubble m])]

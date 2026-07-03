@@ -7,11 +7,19 @@
   not just this one — LM Studio's \"Local Server\" tab equivalent), and
   murakumo fleet announce.
 
-  `kotodama.inference.core/generate` is resolved dynamically at request time
-  (not required at namespace load) so this server boots and every other
+  `kotodama.inference.host.jvm/generate` is resolved dynamically at request
+  time (not required at namespace load) so this server boots and every other
   feature (model manager, fleet) works even before that function lands /
-  if its signature is still moving — chat requests get a clear 503 instead
-  of the whole sidecar failing to start."
+  if its signature moves again — chat requests get a clear 503 instead of
+  the whole sidecar failing to start.
+
+  KNOWN LIMITATION (kotoba-lang/inference#5, merged 2026-07-03): generation
+  runs end-to-end without crashing across all 42 real layers, and KV-cache is
+  verified as a pure optimization (identical output with/without), but output
+  quality is NOT coherent yet — a deep-layer numerical drift versus reference
+  implementations is still open. Every chat response returned by this engine
+  right now is real model output, not a mock, but expect garbled text, not
+  fluent language. See the model note this ns attaches to every response."
   (:require [org.httpkit.server :as http]
             [cheshire.core :as json]
             [clojure.string :as str]
@@ -40,13 +48,18 @@
           (str/split query-string #"&"))))
 
 (defn- generate-fn
-  "nil if kotoba-lang/inference hasn't shipped a generate fn yet, or the ns
-  fails to load (e.g. a transitive dep isn't resolvable in this deps.edn
+  "nil if kotoba-lang/inference hasn't shipped a working generate fn, or the
+  ns fails to load (e.g. a transitive dep isn't resolvable in this deps.edn
   profile) — callers must handle nil, not assume it's always present."
   []
   (try
-    (requiring-resolve 'kotodama.inference.core/generate)
+    (requiring-resolve 'kotodama.inference.host.jvm/generate)
     (catch Throwable _ nil)))
+
+(def ^:private quality-note
+  "Known limitation (kotoba-lang/inference#5): full 42-layer CPU generation
+  runs without crashing/NaN'ing, but a deep-layer numerical drift versus
+  reference implementations means output is not coherent yet.")
 
 (defn- ->model-descriptor [m]
   {:id (:id m) :object "model" :owned_by "murakumo-studio"
@@ -82,16 +95,10 @@
 
 (defn- chat-completion-args [{:keys [messages max_tokens temperature]} model-path on-token]
   (let [prompt (->> messages (map :content) (str/join "\n"))]
-    (cond-> {:model-path model-path
-             :prompt prompt
-             :max-tokens (or max_tokens 256)
-             :temperature (or temperature 0.7)}
-      ;; Speculative: the merged kotoba-lang/inference decode loop supports
-      ;; :kotodama/on-token as a per-token side-effect callback. Map-arg fns
-      ;; ignore unrecognized keys, so passing this is harmless against
-      ;; generate implementations that don't support it yet (today's stub
-      ;; included) — the moment a real callback-aware generate lands this
-      ;; starts streaming for real with no call-site change needed.
+    (cond-> {:kotodama/model-path model-path
+             :kotodama/prompt prompt
+             :kotodama/max-tokens (or max_tokens 256)
+             :kotodama/sample-opts {:kotodama/temperature (or temperature 0.7)}}
       on-token (assoc :kotodama/on-token on-token))))
 
 (defn- handle-chat-completions-blocking [req parsed]
@@ -99,18 +106,20 @@
     (if-let [generate (generate-fn)]
       (if-let [model-path (models/path-for model)]
         (try
-          (let [text (generate (chat-completion-args parsed model-path nil))]
+          (let [result (generate (chat-completion-args parsed model-path nil))
+                text (:kotodama/text result)]
             (json-response 200
                            {:id (str "chatcmpl-" (System/currentTimeMillis))
                             :object "chat.completion"
                             :model model
                             :choices [{:index 0
                                        :message {:role "assistant" :content text}
-                                       :finish_reason "stop"}]}))
+                                       :finish_reason (name (or (:kotodama/stop-reason result) :stop))}]
+                            :murakumo_studio/quality_note quality-note}))
           (catch Throwable e
             (json-response 500 {:error (str "generate failed: " (.getMessage e))})))
         (json-response 404 {:error (str "unknown model: " model)}))
-      (json-response 503 {:error "kotodama.inference.core/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))))
+      (json-response 503 {:error "kotodama.inference.host.jvm/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))))
 
 (defn- handle-chat-completions-stream [req parsed]
   (http/with-channel req channel
@@ -130,11 +139,13 @@
           (if-let [generate (generate-fn)]
             (if-let [model-path (models/path-for model)]
               (try
+                (sse! {:object "chat.completion.chunk" :model model
+                       :murakumo_studio/quality_note quality-note})
                 (generate (chat-completion-args parsed model-path on-token))
                 (catch Throwable e
                   (sse! {:error (str "generate failed: " (.getMessage e))})))
               (sse! {:error (str "unknown model: " model)}))
-            (sse! {:error "kotodama.inference.core/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))
+            (sse! {:error "kotodama.inference.host.jvm/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))
           (catch Throwable e
             (sse! {:error (str e)}))
           (finally

@@ -2,7 +2,7 @@
  ;; real git pins for standalone (non-monorepo) consumption; :dev overrides to
  ;; sibling :local/root when checked out inside the com-junkawasaki west
  ;; superproject (same convention as kotoba-lang/inference's own deps.edn).
- :deps {io.github.kotoba-lang/inference {:git/sha "d4b8de3146e2b9afe318b1e4a8c369b71159a082"}
+ :deps {io.github.kotoba-lang/inference {:git/sha "4cc7461e5a95cf84814e10badd82199d09fd0724"}
         http-kit/http-kit {:mvn/version "2.8.1"}
         cheshire/cheshire {:mvn/version "5.13.0"}}
 

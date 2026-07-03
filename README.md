@@ -13,37 +13,38 @@ superproject (this repo is registered there via
 
 ## Status (v1, Phase 1 of the ADR's roadmap)
 
-- **Inference backend is CPU (`num.cpu`), not GPU/WebGPU.** `kotoba-lang/inference`
-  is pre-1.0; the ADR explicitly scopes WebGPU to Phase 2. `/v1/chat/completions`
-  calls `kotodama.inference.core/generate` dynamically (`requiring-resolve`) —
-  if that function isn't in your pinned `inference` build yet, or its signature
-  has moved, chat requests return a clear `503`/`500` rather than crashing the
-  sidecar; every other feature (model manager, download, fleet announce) works
-  independently of that.
-- **Real end-to-end generation exists upstream (merged), but isn't wired in
-  yet.** [`kotoba-lang/inference#4`](https://github.com/kotoba-lang/inference/pull/4)
-  (merged) adds a genuinely working tokenizer + autoregressive decode loop
-  that runs the real full 42-layer `gemma4:e4b` on CPU without crashing/NaN'ing.
-  Two things still block wiring it into `engine.clj` (in progress, follow-up
-  PR): (1) the stable, working `generate` lives at
-  `kotodama.inference.decode/generate` (portable, takes an injected
-  `:kotodama/forward-fn` + built tokenizer — a primitive, not a one-call
-  convenience fn) plus a JVM host adapter that's currently only in `verify/`
-  (smoke-test code, not a published API) — `kotodama.inference.core/generate`,
-  what this engine actually calls, is still the old unimplemented stub; and
-  (2) **output quality isn't there yet** — real vocabulary tokens across mixed
-  scripts, not coherent text, attributed to missing AltUp/per-layer-embedding
-  layers Gemma4 needs, plus ~100s/token on CPU (no KV-cache) — not viable for
-  interactive chat even once wired. A follow-up PR is in progress to fix both
-  (stable `core.cljc` entry point + KV-cache + the AltUp gap) before this
-  engine is rewired to call it for real.
+- **Chat generation is wired to real `kotoba-lang/inference` and verified
+  working end-to-end — but output quality isn't there yet.** `/v1/chat/completions`
+  calls `kotodama.inference.host.jvm/generate`
+  ([inference#5](https://github.com/kotoba-lang/inference/pull/5), merged),
+  a stable JVM entry point that loads the real GGUF, runs the full 42-layer
+  CPU forward pass with a verified-correct KV-cache (identical output
+  with/without — pure optimization, ~2.76× speedup measured upstream), and
+  returns real generated text. Verified live: prompt "The capital of France
+  is" → `"يبهيبهيبهيبه"` — a real (not mocked, not an error) but **not
+  coherent** response; a deep-layer numerical drift versus reference
+  implementations (llama.cpp/HF/Ollama) is still open upstream. Every
+  response carries a `murakumo_studio/quality_note` field (and the Chat tab
+  shows a ⚠ banner) saying so explicitly — this isn't hidden from users.
+  If `kotodama.inference.host.jvm/generate` isn't resolvable at all (e.g. an
+  older pinned `inference` build), chat requests get a clear `503`/`500`
+  instead of crashing the sidecar; every other feature (model manager,
+  download, fleet announce) works independently of that.
+- **CPU generation is slow: tens of seconds per token**, dominated by
+  re-reading and dequantizing GGUF weights from disk per session (no weight
+  caching or session reuse across chat turns yet — each `/v1/chat/completions`
+  call currently opens and closes its own session). `Settings → max tokens`
+  defaults to 32, not the more conventional 256, to keep replies from taking
+  many minutes. GPU/WebGPU (ADR-2607032700 Phase 2) is the real fix.
 - **Model management (local scan, HF Hub search/browse/resumable download),
   streaming chat (SSE, `/v1/chat/completions` with `stream: true` — real
-  token-by-token once the callback above lands, currently one error event),
-  local OpenAI-compatible server, and fleet announce are real and tested**
+  token-by-token via `:kotodama/on-token`, not simulated), local
+  OpenAI-compatible server, and fleet announce are real and tested**
   (see `test/murakumo_studio/models_test.clj`, live browser session testing
   of `src/murakumo_studio/ui.cljs` against the real running engine, and manual
-  end-to-end verification of `src/murakumo_studio/engine.clj` via `curl`).
+  end-to-end verification of `src/murakumo_studio/engine.clj` via `curl`,
+  including a real ~6.5min/4-token generation run against the actual
+  `gemma4:e4b` GGUF).
 - **Fleet participation is announce-only.** Joining as a `murakumo.infer`
   compute worker (did:key/CACAO identity, actual shard-plan participation) is
   Phase 3, not implemented here.
@@ -63,7 +64,7 @@ JVM engine sidecar (src/murakumo_studio/engine.clj, spawned by the Rust shell)
  │                             ~/.ollama/models) + HF Hub download
  ├─ murakumo_studio.fleet   — announce-only client for
  │                             gftdcojp/cloud-murakumo-fleet's /infer/* API
- └─ kotodama.inference.core/generate (kotoba-lang/inference, resolved
+ └─ kotodama.inference.host.jvm/generate (kotoba-lang/inference, resolved
                              dynamically — see Status above)
 ```
 
