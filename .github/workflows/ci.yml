@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  clj-test:
+    name: clojure -M:test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache m2 / gitlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+          key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
+          restore-keys: ${{ runner.os }}-clj-
+      - run: clojure -M:test
+
+  frontend-build:
+    name: shadow-cljs compile + kotoba-ui CSS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: murakumo-studio
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+          bb: latest
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Cache m2 / gitlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+          key: ${{ runner.os }}-cljs-${{ hashFiles('murakumo-studio/deps.edn') }}
+          restore-keys: ${{ runner.os }}-cljs-
+      # kotoba-ui.core / appkit.core design-system chain (deps.edn :local/root
+      # is unconditional for these repos, same as gftdcojp/manimani and
+      # kotoba-lang/appkit's own CI — not published as git/sha-pinnable yet).
+      - name: Checkout shitsuke sibling
+        run: git clone --depth 1 https://github.com/kotoba-lang/shitsuke shitsuke
+      - name: Checkout liquid-glass-ui sibling
+        run: git clone --depth 1 https://github.com/kotoba-lang/liquid-glass-ui liquid-glass-ui
+      - name: Checkout css sibling (bb ui-css :paths)
+        run: git clone --depth 1 https://github.com/kotoba-lang/css css
+      - name: Checkout kotoba-ui sibling
+        run: git clone --depth 1 https://github.com/kotoba-lang/kotoba-ui kotoba-ui
+      - name: Checkout appkit sibling
+        run: git clone --depth 1 https://github.com/kotoba-lang/appkit appkit
+      - name: bb ui-css
+        working-directory: murakumo-studio
+        run: bb ui-css
+      - name: npm install
+        working-directory: murakumo-studio
+        run: npm install --no-audit --no-fund
+      - name: shadow-cljs compile app
+        working-directory: murakumo-studio
+        run: npx shadow-cljs compile app
+
+  rust-check:
+    name: cargo check + clippy (tauri shell)
+    # macos-latest specifically: tauri/src-tauri/.cargo/config.toml hardcodes
+    # target = "aarch64-apple-darwin" to escape the west-superproject-root
+    # .cargo/config.toml's wasm32-unknown-unknown default (same as
+    # gftdcojp/manimani/tauri). Cross-platform (Windows/Linux/Intel Mac)
+    # packaging is a documented v1 follow-up, not solved here.
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: tauri/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: .
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri/src-tauri
+      - run: cargo check
+      - run: cargo clippy -- -D warnings
