@@ -1,0 +1,5 @@
+# Override the west-superproject-root .cargo/config.toml (which forces
+# wasm32-unknown-unknown for kotoba WASM builds) — this app builds for the
+# host desktop target. Same override as gftdcojp/manimani/tauri.
+[build]
+target = "aarch64-apple-darwin"

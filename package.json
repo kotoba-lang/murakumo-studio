@@ -1,0 +1,18 @@
+{
+  "name": "murakumo-studio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local inference desktop app (kotoba-lang/inference based, LM Studio-like)",
+  "scripts": {
+    "gui:watch": "shadow-cljs watch app",
+    "gui:release": "shadow-cljs release app",
+    "gui:compile": "shadow-cljs compile app"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "shadow-cljs": "^2.28.20"
+  }
+}

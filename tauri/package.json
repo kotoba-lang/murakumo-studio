@@ -1,0 +1,12 @@
+{
+  "name": "murakumo-studio-tauri",
+  "private": true,
+  "version": "0.1.0",
+  "description": "murakumo-studio desktop shell (Tauri v2)",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2"
+  }
+}
