@@ -49,6 +49,14 @@
     (is (thrown? clojure.lang.ExceptionInfo (models/download! {:repo-id "" :file "x.gguf"})))
     (is (thrown? clojure.lang.ExceptionInfo (models/download! {:repo-id "org/repo" :file ""})))))
 
+(deftest search-hf!-validates-args-test
+  (testing "rejects a blank query before attempting any network call"
+    (is (thrown? clojure.lang.ExceptionInfo (models/search-hf! "")))))
+
+(deftest list-hf-gguf-files!-validates-args-test
+  (testing "rejects a blank repo-id before attempting any network call"
+    (is (thrown? clojure.lang.ExceptionInfo (models/list-hf-gguf-files! "")))))
+
 (deftest ollama-manifest-scan-test
   (testing "reads a synthetic Ollama manifest tree the same way `ollama pull` lays one out"
     (let [tmp (temp-dir!)

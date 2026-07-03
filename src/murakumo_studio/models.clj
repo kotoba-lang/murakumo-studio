@@ -1,5 +1,5 @@
 (ns murakumo-studio.models
-  "Local model discovery + Hugging Face Hub download. Scans
+  "Local model discovery + Hugging Face Hub search/download. Scans
   ~/.murakumo-studio/models/*.gguf (models murakumo-studio itself downloaded)
   and, read-only, an existing Ollama install's blob store so users don't have
   to re-download models they already have (ADR-2607032700 §4)."
@@ -7,7 +7,9 @@
             [clojure.string :as str]
             [cheshire.core :as json])
   (:import [java.io File]
-           [java.net URI]))
+           [java.net URI]
+           [java.net.http HttpClient HttpClient$Redirect HttpRequest HttpResponse HttpResponse$BodyHandlers]
+           [java.time Duration]))
 
 (defn- home [] (System/getProperty "user.home"))
 
@@ -85,16 +87,82 @@
 (defn path-for [id]
   (:path (first (filter #(= (:id %) id) @cache))))
 
+;; HttpClient defaults to NOT following redirects; HF's /resolve/ endpoint
+;; 307-redirects to a signed CDN URL, so this must be explicit (found by
+;; actually running a real download against huggingface.co, not assumed).
+(def ^:private http-client
+  (delay (-> (HttpClient/newBuilder) (.followRedirects HttpClient$Redirect/NORMAL) (.build))))
+
+(defn- hf-get-json [path]
+  (let [req (-> (HttpRequest/newBuilder)
+                (.uri (URI. (str "https://huggingface.co" path)))
+                (.timeout (Duration/ofSeconds 15))
+                (.GET)
+                (.build))
+        res (.send ^HttpClient @http-client req (HttpResponse$BodyHandlers/ofString))]
+    (if (= 200 (.statusCode res))
+      (json/parse-string (.body res) true)
+      (throw (ex-info (str "Hugging Face Hub request failed: HTTP " (.statusCode res))
+                       {:path path :status (.statusCode res)})))))
+
+(defn search-hf!
+  "Search public Hugging Face Hub model repos by query string. Returns a
+  vector of `{:id \"org/repo\" :downloads N :likes N}`; does not filter by
+  GGUF presence up front (a repo can host GGUF alongside other formats) —
+  call `list-hf-gguf-files!` on a chosen repo to see its actual .gguf files."
+  [query]
+  (when (str/blank? query)
+    (throw (ex-info "query is required" {:query query})))
+  (let [encoded (java.net.URLEncoder/encode query "UTF-8")
+        results (hf-get-json (str "/api/models?search=" encoded "&limit=25"))]
+    (mapv (fn [m] {:id (:id m) :downloads (:downloads m) :likes (:likes m)}) results)))
+
+(defn list-hf-gguf-files!
+  "List every *.gguf sibling file in a Hugging Face Hub repo."
+  [repo-id]
+  (when (str/blank? repo-id)
+    (throw (ex-info "repo-id is required" {:repo-id repo-id})))
+  (let [info (hf-get-json (str "/api/models/" repo-id))]
+    (->> (:siblings info)
+         (map :rfilename)
+         (filter #(str/ends-with? % ".gguf"))
+         (mapv (fn [f] {:filename f})))))
+
+(defn- write-body-to-file! [^HttpResponse res ^File dest append?]
+  (with-open [in (.body res)
+              out (io/output-stream dest :append append?)]
+    (io/copy in out)))
+
 (defn download!
-  "Full (non-resumable) download of a single GGUF file from a public
-  Hugging Face Hub repo. Resumable HTTP Range download is a documented
-  follow-up (ADR-2607032700 §4) — not implemented in v1."
+  "Resumable (HTTP Range) download of a single GGUF file from a public
+  Hugging Face Hub repo, into studio-models-dir. Downloads to a `.part`
+  sidecar and only renames to the final name on completion, so a killed/
+  interrupted download resumes instead of restarting, and a half-downloaded
+  file never shows up as a usable model. If the final file already exists
+  (previously completed), returns it immediately without re-downloading."
   [{:keys [repo-id file]}]
   (when (or (str/blank? repo-id) (str/blank? file))
     (throw (ex-info "repo-id and file are required" {:repo-id repo-id :file file})))
   (let [url (str "https://huggingface.co/" repo-id "/resolve/main/" file "?download=true")
-        dest (io/file (studio-models-dir) (last (str/split file #"/")))]
-    (with-open [in (.openStream (.toURL (URI. url)))]
-      (io/copy in dest))
-    (refresh!)
-    {:path (.getAbsolutePath dest) :size_bytes (.length dest) :repo_id repo-id :file file}))
+        fname (last (str/split file #"/"))
+        dest (io/file (studio-models-dir) fname)
+        part (io/file (studio-models-dir) (str fname ".part"))]
+    (if (.isFile dest)
+      {:path (.getAbsolutePath dest) :size_bytes (.length dest) :repo_id repo-id :file file :resumed false :already-present true}
+      (let [offset (if (.isFile part) (.length part) 0)
+            req-builder (-> (HttpRequest/newBuilder)
+                             (.uri (URI. url))
+                             (.timeout (Duration/ofMinutes 30)))
+            req-builder (if (pos? offset)
+                          (.header req-builder "Range" (str "bytes=" offset "-"))
+                          req-builder)
+            res (.send ^HttpClient @http-client (.build req-builder) (HttpResponse$BodyHandlers/ofInputStream))
+            status (.statusCode res)]
+        (cond
+          (= 206 status) (write-body-to-file! res part true)   ; server honored our Range resume
+          (= 200 status) (write-body-to-file! res part false)  ; server ignored Range -> full body, start over
+          :else (throw (ex-info (str "download failed: HTTP " status) {:repo-id repo-id :file file :status status})))
+        (io/make-parents dest)
+        (.renameTo part dest)
+        (refresh!)
+        {:path (.getAbsolutePath dest) :size_bytes (.length dest) :repo_id repo-id :file file :resumed (pos? offset)}))))

@@ -3,7 +3,8 @@
   (src/murakumo_studio/engine.clj), spawned and supervised by the Tauri Rust
   shell (tauri/src-tauri/src/main.rs). The frontend never talks to
   kotoba-lang/inference directly — it only ever speaks HTTP/JSON to this
-  localhost process, which is the only thing running on the JVM.")
+  localhost process, which is the only thing running on the JVM."
+  (:require [clojure.string :as str]))
 
 (def default-port 8721)
 
@@ -35,10 +36,15 @@
               {:method "POST"
                :body (js/JSON.stringify (clj->js {:repo_id repo-id :file file}))}))
 
+(defn search-hf [query]
+  (json-fetch (str "/models/search?q=" (js/encodeURIComponent query)) {:method "GET"}))
+
+(defn list-hf-gguf-files [repo-id]
+  (json-fetch (str "/models/hf-files?repo_id=" (js/encodeURIComponent repo-id)) {:method "GET"}))
+
 (defn chat-completion
-  "Non-streaming v1 (kotoba-lang/inference's decode loop is single-request; a
-  streaming /v1/chat/completions is a follow-up once token-by-token flush is
-  wired through the engine)."
+  "Non-streaming. Kept alongside chat-completion-stream for callers that just
+  want the final text (e.g. non-UI scripting)."
   [{:keys [model messages temperature max-tokens]}]
   (json-fetch "/v1/chat/completions"
               {:method "POST"
@@ -48,6 +54,57 @@
                                 :temperature (or temperature 0.7)
                                 :max_tokens (or max-tokens 256)
                                 :stream false}))}))
+
+(defn- process-sse-buffer! [buf-atom done? {:keys [on-chunk on-done on-error]}]
+  (let [lines (str/split @buf-atom #"\n" -1)
+        complete (if done? lines (butlast lines))
+        remainder (if done? "" (or (last lines) ""))]
+    (reset! buf-atom remainder)
+    (doseq [line complete]
+      (when (str/starts-with? line "data: ")
+        (let [payload (subs line 6)]
+          (cond
+            (= payload "[DONE]") (when on-done (on-done))
+            (seq payload)
+            (let [data (js->clj (js/JSON.parse payload) :keywordize-keys true)]
+              (if (:error data)
+                (when on-error (on-error (:error data)))
+                (when-let [content (get-in data [:choices 0 :delta :content])]
+                  (when on-chunk (on-chunk content)))))))))))
+
+(defn chat-completion-stream
+  "Streams /v1/chat/completions over SSE. `callbacks` is
+  {:on-chunk (fn [content-str]) :on-done (fn []) :on-error (fn [msg])} — each
+  optional. Returns nothing; the caller drives UI state from the callbacks."
+  [{:keys [model messages temperature max-tokens]} callbacks]
+  (-> (js/fetch (str (base-url) "/v1/chat/completions")
+                (clj->js {:method "POST"
+                          :headers {"Content-Type" "application/json"}
+                          :body (js/JSON.stringify
+                                 (clj->js {:model model
+                                           :messages messages
+                                           :temperature (or temperature 0.7)
+                                           :max_tokens (or max-tokens 256)
+                                           :stream true}))}))
+      (.then
+       (fn [res]
+         (if-not (.-ok res)
+           (.then (.text res)
+                  (fn [body] (throw (js/Error. (str "HTTP " (.-status res) ": " body)))))
+           (let [reader (.getReader (.-body res))
+                 decoder (js/TextDecoder. "utf-8")
+                 buf (atom "")]
+             (letfn [(pump []
+                       (.then (.read reader)
+                              (fn [result]
+                                (let [done (.-done result)
+                                      value (.-value result)]
+                                  (when value
+                                    (swap! buf str (.decode decoder value #js {:stream true})))
+                                  (process-sse-buffer! buf done callbacks)
+                                  (when-not done (pump))))))]
+               (pump))))))
+      (.catch (fn [e] (when-let [on-error (:on-error callbacks)] (on-error (str e)))))))
 
 (defn fleet-status []
   (json-fetch "/fleet/status" {:method "GET"}))

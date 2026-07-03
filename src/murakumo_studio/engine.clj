@@ -31,6 +31,14 @@
   (when body
     (json/parse-string (slurp body) true)))
 
+(defn- parse-query [query-string]
+  (when-not (str/blank? query-string)
+    (into {}
+          (map (fn [kv]
+                 (let [[k v] (str/split kv #"=" 2)]
+                   [(keyword k) (some-> v (java.net.URLDecoder/decode "UTF-8"))])))
+          (str/split query-string #"&"))))
+
 (defn- generate-fn
   "nil if kotoba-lang/inference hasn't shipped a generate fn yet, or the ns
   fails to load (e.g. a transitive dep isn't resolvable in this deps.edn
@@ -58,16 +66,40 @@
     (catch Exception e
       (json-response 400 {:error (.getMessage e)}))))
 
-(defn- handle-chat-completions [req]
-  (let [{:keys [model messages max_tokens temperature]} (read-json-body req)
-        prompt (->> messages (map :content) (str/join "\n"))]
+(defn- handle-models-search [req]
+  (try
+    (let [{:keys [q]} (parse-query (:query-string req))]
+      (json-response 200 {:object "list" :data (models/search-hf! q)}))
+    (catch Exception e
+      (json-response 400 {:error (.getMessage e)}))))
+
+(defn- handle-models-hf-files [req]
+  (try
+    (let [{:keys [repo_id]} (parse-query (:query-string req))]
+      (json-response 200 {:object "list" :data (models/list-hf-gguf-files! repo_id)}))
+    (catch Exception e
+      (json-response 400 {:error (.getMessage e)}))))
+
+(defn- chat-completion-args [{:keys [messages max_tokens temperature]} model-path on-token]
+  (let [prompt (->> messages (map :content) (str/join "\n"))]
+    (cond-> {:model-path model-path
+             :prompt prompt
+             :max-tokens (or max_tokens 256)
+             :temperature (or temperature 0.7)}
+      ;; Speculative: the merged kotoba-lang/inference decode loop supports
+      ;; :kotodama/on-token as a per-token side-effect callback. Map-arg fns
+      ;; ignore unrecognized keys, so passing this is harmless against
+      ;; generate implementations that don't support it yet (today's stub
+      ;; included) — the moment a real callback-aware generate lands this
+      ;; starts streaming for real with no call-site change needed.
+      on-token (assoc :kotodama/on-token on-token))))
+
+(defn- handle-chat-completions-blocking [req parsed]
+  (let [{:keys [model]} parsed]
     (if-let [generate (generate-fn)]
       (if-let [model-path (models/path-for model)]
         (try
-          (let [text (generate {:model-path model-path
-                                 :prompt prompt
-                                 :max-tokens (or max_tokens 256)
-                                 :temperature (or temperature 0.7)})]
+          (let [text (generate (chat-completion-args parsed model-path nil))]
             (json-response 200
                            {:id (str "chatcmpl-" (System/currentTimeMillis))
                             :object "chat.completion"
@@ -79,6 +111,41 @@
             (json-response 500 {:error (str "generate failed: " (.getMessage e))})))
         (json-response 404 {:error (str "unknown model: " model)}))
       (json-response 503 {:error "kotodama.inference.core/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))))
+
+(defn- handle-chat-completions-stream [req parsed]
+  (http/with-channel req channel
+    (http/send! channel
+                {:status 200
+                 :headers {"Content-Type" "text/event-stream"
+                           "Cache-Control" "no-cache"
+                           "Access-Control-Allow-Origin" "*"}}
+                false)
+    (let [{:keys [model]} parsed
+          sse! (fn [data] (http/send! channel (str "data: " (json/generate-string data) "\n\n") false))
+          on-token (fn [_token-id token-text _elapsed-nanos]
+                     (sse! {:object "chat.completion.chunk" :model model
+                            :choices [{:index 0 :delta {:content token-text}}]}))]
+      (future
+        (try
+          (if-let [generate (generate-fn)]
+            (if-let [model-path (models/path-for model)]
+              (try
+                (generate (chat-completion-args parsed model-path on-token))
+                (catch Throwable e
+                  (sse! {:error (str "generate failed: " (.getMessage e))})))
+              (sse! {:error (str "unknown model: " model)}))
+            (sse! {:error "kotodama.inference.core/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))
+          (catch Throwable e
+            (sse! {:error (str e)}))
+          (finally
+            (http/send! channel "data: [DONE]\n\n" false)
+            (http/close channel)))))))
+
+(defn- handle-chat-completions [req]
+  (let [parsed (read-json-body req)]
+    (if (:stream parsed)
+      (handle-chat-completions-stream req parsed)
+      (handle-chat-completions-blocking req parsed))))
 
 (defn- handle-fleet-status [_req] (json-response 200 (fleet/status)))
 (defn- handle-fleet-join [_req] (json-response 200 (fleet/join!)))
@@ -92,6 +159,8 @@
     (and (= request-method :get) (= uri "/v1/models")) (handle-models-list req)
     (and (= request-method :post) (= uri "/models/scan")) (handle-models-scan req)
     (and (= request-method :post) (= uri "/models/download")) (handle-models-download req)
+    (and (= request-method :get) (= uri "/models/search")) (handle-models-search req)
+    (and (= request-method :get) (= uri "/models/hf-files")) (handle-models-hf-files req)
     (and (= request-method :post) (= uri "/v1/chat/completions")) (handle-chat-completions req)
     (and (= request-method :get) (= uri "/fleet/status")) (handle-fleet-status req)
     (and (= request-method :post) (= uri "/fleet/join")) (handle-fleet-join req)

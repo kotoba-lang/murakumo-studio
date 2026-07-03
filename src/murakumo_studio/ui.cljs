@@ -2,11 +2,21 @@
   "murakumo-studio's view tree. Structural chrome (panel/list-view/tab-bar/
   badge/divider) comes from appkit.core (desktop binding) / kotoba-ui.core
   (kotoba-lang default design system, ADR-2607022800). Interactive controls
-  that need a live reagent handler (button/text-field/text-area/menu-select/
-  toggle) use kotoba-ui's `:on-*` escape hatches directly — only `button`
-  lacks one (shitsuke's :act SSR contract has no on-click), so `btn` below is
-  a small hand-rolled button styled via kotoba-ui's exposed `class-name`,
-  mirroring gftdcojp/manimani/src/manimani/ui.cljc's `sbutton`."
+  that need a live reagent handler (button/text-field/menu-select/toggle) use
+  kotoba-ui's `:on-*` escape hatches directly — two components don't support
+  the interactivity this app needs, so we work around them with small
+  hand-rolled equivalents styled via kotoba-ui's exposed `class-name`
+  (mirroring gftdcojp/manimani/src/manimani/ui.cljc's `sbutton`):
+    - `button` only supports shitsuke's :act SSR contract, no on-click at all.
+    - `text-area` (shitsuke.components/textarea) renders `value` as DOM
+      children instead of a `value` prop, so React treats it as effectively
+      uncontrolled — typing works (native DOM mutation), but programmatic
+      resets (e.g. clearing the chat input after send) never reach the DOM.
+      Confirmed via a live browser session: after `swap!`-ing :input back to
+      \"\", the atom read back \"\" but the visible <textarea> kept showing the
+      old text even across an unmount/remount. `text-field` (<input>) does
+      NOT have this bug — shitsuke.components/input sets :value as a real
+      prop — so only textarea needs the workaround."
   (:require [appkit.core :as shape]
             [kotoba-ui.core :as ui]
             [murakumo-studio.state :as state]
@@ -23,6 +33,16 @@
              :disabled (boolean disabled?)
              :on-click on-click}
     label]))
+
+(defn- text-area
+  "Properly controlled replacement for kotoba-ui's text-area (see ns
+  docstring) — same DOM shape (outer div wrapper the CSS targets via a
+  descendant selector, `.liquid-glass__text-area textarea`), but the
+  <textarea>'s value is a real React prop so programmatic resets work."
+  [{:keys [value rows placeholder on-input]}]
+  [:div {:class (ui/class-name :text-area)}
+   [:textarea {:value (or value "") :rows (or rows 6) :placeholder placeholder
+               :on-change on-input}]])
 
 (defn- fmt-bytes [n]
   (cond
@@ -102,7 +122,7 @@
       (when error [:div {:style {:color "#ff8a8a"}} (str error)])
       (if (empty? items)
         [:div {:style {:opacity 0.6}} "No models found yet. Try Rescan, or use the Download tab."]
-        [ui/list-view (mapv model-row items)])]]))
+        [ui/list-view (mapv (fn [m] ^{:key (:id m)} [model-row m]) items)])]]))
 
 ;; ---------------------------------------------------------------------------
 ;; Chat tab
@@ -111,20 +131,23 @@
   (let [{:keys [model input messages]} (:chat @state/state)]
     (when (and model (seq (clojure.string/trim input)))
       (let [user-msg {:role "user" :content input}
-            history (conj messages user-msg)]
-        (swap! state/state update :chat merge {:messages history :input "" :busy? true :error nil})
-        (-> (client/chat-completion
-             {:model model
-              :messages history
-              :temperature (get-in @state/state [:settings :temperature])
-              :max-tokens (get-in @state/state [:settings :max-tokens])})
-            (.then (fn [res]
-                     (let [reply (get-in res [:choices 0 :message])]
-                       (swap! state/state update :chat merge
-                              {:messages (conj history (or reply {:role "assistant" :content "(no reply)"}))
-                               :busy? false}))))
-            (.catch (fn [e]
-                      (swap! state/state update :chat merge {:busy? false :error (str e)}))))))))
+            history (conj messages user-msg)
+            ;; empty assistant placeholder, filled in progressively as SSE
+            ;; chunks arrive (real streaming once kotoba-lang/inference wires
+            ;; a token callback through — see engine.clj chat-completion-args)
+            assistant-idx (count history)]
+        (swap! state/state update :chat merge
+               {:messages (conj history {:role "assistant" :content ""})
+                :input "" :busy? true :error nil})
+        (client/chat-completion-stream
+         {:model model
+          :messages history
+          :temperature (get-in @state/state [:settings :temperature])
+          :max-tokens (get-in @state/state [:settings :max-tokens])}
+         {:on-chunk (fn [content]
+                      (swap! state/state update-in [:chat :messages assistant-idx :content] str content))
+          :on-done (fn [] (swap! state/state assoc-in [:chat :busy?] false))
+          :on-error (fn [msg] (swap! state/state update :chat merge {:busy? false :error msg}))})))))
 
 (defn- message-bubble [{:keys [role content]}]
   [:div {:class "ms-chat-log"
@@ -146,36 +169,87 @@
        (for [[i m] (map-indexed vector messages)]
          ^{:key i} [message-bubble m])]
       (when error [:div {:style {:color "#ff8a8a"}} (str error)])
-      [ui/text-area {:value input :rows 3 :placeholder "Ask something…"
-                      :on-input #(swap! state/state assoc-in [:chat :input] (.. % -target -value))}]
+      [text-area {:value input :rows 3 :placeholder "Ask something…"
+                  :on-input #(swap! state/state assoc-in [:chat :input] (.. % -target -value))}]
       [:div {:style {:margin-top "8px"}}
        [btn (if busy? "Generating…" "Send") send-message! {:disabled? (or busy? (not model))}]]]]))
 
 ;; ---------------------------------------------------------------------------
 ;; Download tab
 
-(defn- download! []
-  (let [{:keys [repo-id file]} (:download @state/state)]
-    (swap! state/state update :download merge {:busy? true :error nil :done nil})
-    (-> (client/download-model {:repo-id repo-id :file file})
-        (.then (fn [res]
-                 (swap! state/state update :download merge {:busy? false :done res})
-                 (load-models!)))
-        (.catch (fn [e]
-                  (swap! state/state update :download merge {:busy? false :error (str e)}))))))
+(defn- download! [repo-id file]
+  (swap! state/state update :download merge {:busy? true :error nil :done nil})
+  (-> (client/download-model {:repo-id repo-id :file file})
+      (.then (fn [res]
+               (swap! state/state update :download merge {:busy? false :done res})
+               (load-models!)))
+      (.catch (fn [e]
+                (swap! state/state update :download merge {:busy? false :error (str e)})))))
+
+(defn- search-hf! []
+  (let [query (get-in @state/state [:download :query])]
+    (when (seq (clojure.string/trim query))
+      (swap! state/state update :download merge {:searching? true :error nil})
+      (-> (client/search-hf query)
+          (.then (fn [res]
+                   (swap! state/state update :download merge
+                          {:results (:data res) :searching? false})))
+          (.catch (fn [e]
+                    (swap! state/state update :download merge
+                           {:searching? false :error (str e)})))))))
+
+(defn- browse-hf-repo! [repo-id]
+  (swap! state/state update :download merge
+         {:selected-repo repo-id :hf-files [] :listing? true :error nil})
+  (-> (client/list-hf-gguf-files repo-id)
+      (.then (fn [res]
+               (swap! state/state update :download merge
+                      {:hf-files (:data res) :listing? false})))
+      (.catch (fn [e]
+                (swap! state/state update :download merge
+                       {:listing? false :error (str e)})))))
+
+(defn- hf-search-result-row [{:keys [id downloads likes]}]
+  [ui/list-row
+   [:div
+    [:div {:style {:font-weight 600}} id]
+    [:div {:style {:opacity 0.7 :font-size "12px"}}
+     (or downloads 0) " downloads · " (or likes 0) " likes"]]
+   {:trailing (btn "Browse files" #(browse-hf-repo! id))}])
+
+(defn- hf-file-row [repo-id {:keys [filename]}]
+  [ui/list-row filename
+   {:trailing (btn "Download" #(download! repo-id filename)
+                    {:disabled? (:busy? (:download @state/state))})}])
 
 (defn- download-tab []
-  (let [{:keys [repo-id file busy? error done]} (:download @state/state)]
+  (let [{:keys [repo-id file busy? error done query results searching?
+                selected-repo hf-files listing?]} (:download @state/state)]
     [shape/panel
      [:div
       [:div {:style {:opacity 0.7 :margin-bottom "8px"}}
-       "Download a GGUF file from a Hugging Face Hub repo."]
+       "Search Hugging Face Hub, browse a repo's GGUF files, and download —
+       or paste an exact repo-id/filename below."]
+      [ui/text-field {:value query :placeholder "search models (e.g. \"gemma gguf\")"
+                       :on-input #(swap! state/state assoc-in [:download :query] (.. % -target -value))}]
+      [:div {:style {:margin "8px 0"}}
+       [btn (if searching? "Searching…" "Search") search-hf! {:disabled? searching?}]]
+      (when (seq results)
+        [ui/list-view (mapv (fn [r] ^{:key (:id r)} [hf-search-result-row r]) results)])
+      (when selected-repo
+        [:div {:style {:margin-top "10px"}}
+         [:div {:style {:font-weight 600 :margin-bottom "6px"}}
+          (if listing? (str "Loading files for " selected-repo "…") (str "Files in " selected-repo))]
+         (when (seq hf-files)
+           [ui/list-view (mapv (fn [f] ^{:key (:filename f)} [hf-file-row selected-repo f]) hf-files)])])
+      [ui/divider]
+      [:div {:style {:opacity 0.7 :margin "8px 0"}} "Or paste an exact repo-id + filename:"]
       [ui/text-field {:value repo-id :placeholder "e.g. bartowski/gemma-4-e4b-it-GGUF"
                        :on-input #(swap! state/state assoc-in [:download :repo-id] (.. % -target -value))}]
       [ui/text-field {:value file :placeholder "e.g. gemma-4-e4b-it-Q4_K_M.gguf"
                        :on-input #(swap! state/state assoc-in [:download :file] (.. % -target -value))}]
       [:div {:style {:margin-top "8px"}}
-       [btn (if busy? "Downloading…" "Download") download!
+       [btn (if busy? "Downloading…" "Download") #(download! repo-id file)
         {:disabled? (or busy? (empty? repo-id) (empty? file))}]]
       (when error [:div {:style {:color "#ff8a8a" :margin-top "6px"}} (str error)])
       (when done [:div {:style {:margin-top "6px"}} (str "Saved: " (:path done))])]]))
