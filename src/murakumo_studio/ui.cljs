@@ -16,7 +16,14 @@
       \"\", the atom read back \"\" but the visible <textarea> kept showing the
       old text even across an unmount/remount. `text-field` (<input>) does
       NOT have this bug — shitsuke.components/input sets :value as a real
-      prop — so only textarea needs the workaround."
+      prop — so only textarea needs the workaround.
+    - `model-select` (shitsuke.components/select) has the same class of bug:
+      the `<select>` itself carries no `:value` prop (uncontrolled), each
+      `<option>` instead gets a `:selected (= v value)` attribute, and the
+      `<option>`s have no React `:key` — confirmed live: real, reproducible
+      React warnings (\"Each child in a list should have a unique key prop\",
+      \"Use the defaultValue or value props on <select> instead of setting
+      selected on <option>\") on every render, not just a one-off."
   (:require [appkit.core :as shape]
             [kotoba-ui.core :as ui]
             [murakumo-studio.state :as state]
@@ -43,6 +50,17 @@
   [:div {:class (ui/class-name :text-area)}
    [:textarea {:value (or value "") :rows (or rows 6) :placeholder placeholder
                :on-change on-input}]])
+
+(defn- model-select
+  "Properly controlled replacement for kotoba-ui's menu-select (see ns
+  docstring) — same DOM shape (`.liquid-glass__menu-select` wrapper + a
+  specular decoration span the CSS already targets), but the <select>
+  carries a real `value` prop and each <option> has a React :key."
+  [options {:keys [value on-change]}]
+  [:div {:class (ui/class-name :menu-select)}
+   [:select {:value (or value "") :on-change on-change}
+    (for [[v l] options] ^{:key v} [:option {:value v} l])]
+   [:span {:aria-hidden true :class (ui/class-name :specular)}]])
 
 (defn- fmt-bytes [n]
   (cond
@@ -161,7 +179,7 @@
         model-ids (mapv :id (get-in @state/state [:models :items]))]
     [shape/panel
      [:div
-      [ui/menu-select (mapv (fn [id] [id id]) model-ids)
+      [model-select (mapv (fn [id] [id id]) model-ids)
        {:value (or model "") :on-change #(swap! state/state assoc-in [:chat :model] (.. % -target -value))}]
       (when (empty? model-ids)
         [:div {:style {:opacity 0.6 :margin-top "6px"}} "No models loaded — pick one from the Models tab first."])
