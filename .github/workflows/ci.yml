@@ -31,6 +31,7 @@ jobs:
           key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
           restore-keys: ${{ runner.os }}-clj-
       - run: clojure -M:test
+      - run: clojure -M:lint
 
   frontend-build:
     name: shadow-cljs compile + kotoba-ui CSS
