@@ -6,7 +6,10 @@
   "scripts": {
     "gui:watch": "shadow-cljs watch app",
     "gui:release": "shadow-cljs release app",
-    "gui:compile": "shadow-cljs compile app"
+    "gui:compile": "shadow-cljs compile app",
+    "task": "nbb scripts/run-task.cljs",
+    "tasks": "nbb scripts/run-task.cljs",
+    "test": "nbb scripts/run-task.cljs test"
   },
   "dependencies": {
     "react": "^18.3.1",
